@@ -10,13 +10,16 @@ using ForwardDiff
 using HDF5
 using LinearAlgebra
 
+const TO = Altro.TrajectoryOptimization
+const RD = Altro.RobotDynamics
+
 # paths
 const EXPERIMENT_META = "spin"
 const EXPERIMENT_NAME = "spin1"
 const SAVE_PATH = abspath(joinpath(WDIR, "out", EXPERIMENT_META, EXPERIMENT_NAME))
 
 # model
-struct Model{TH,Tis,Tic,Tid} <: AbstractModel
+struct Model{TH,Tis,Tic,Tid} <: RD.AbstractModel
     # problem size
     n::Int
     m::Int
@@ -56,15 +59,16 @@ function Model(M_, Md_, V_, Hs, time_optimal)
 end
 
 @inline Base.size(model::Model) = model.n, model.m
+RD.diffmethod(::Model) = RD.FiniteDifference()
 # vector and matrix constructors (use CPU arrays)
 @inline M(mat_) = mat_
 @inline Md(mat_) = mat_
 @inline V(vec_) = vec_
 
 # dynamics
-abstract type EXP <: Explicit end
+abstract type EXP <: RD.Explicit end
 
-function Altro.discrete_dynamics(::Type{EXP}, model::Model,
+function RD.discrete_dynamics(::Type{EXP}, model::Model,
                               astate::AbstractVector,
                               acontrol::AbstractVector, time::Real, dt_::Real)
     dt = !model.time_optimal ? dt_ : acontrol[model.dt_idx[1]]^2
@@ -89,7 +93,7 @@ end
 function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
                   time_optimal=false, qs=[1e0, 1e-1, 1e-1, 1e-1, 1e-1], smoke_test=false,
                   save=true, benchmark=false, max_iterations=10000, bp_reg_fp=10.,
-                  dJ_counter_limit=20, bp_reg_type=:control, projected_newton=true)
+                  dJ_counter_limit=20, bp_reg_type=:control, projected_newton=false)
     # initialize model
     Hs = [M(H) for H in (NEGI_H0_ISO, NEGI_H1_ISO)]
     model = Model(M, Md, V, Hs, time_optimal)
@@ -156,7 +160,7 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
     ts[1] = t0
     for k = 1:N-1
         ts[k + 1] = ts[k] + dt
-        discrete_dynamics!(X0[k + 1], EXP, model, X0[k], U0[k], ts[k], dt)
+        X0[k + 1] .= Altro.discrete_dynamics(EXP, model, X0[k], U0[k], ts[k], dt)
     end
     
     # cost function
@@ -174,22 +178,24 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
         R[model.dt_idx] .= qs[5]
     end
     R = Diagonal(V(R))
-    objective = LQRObjective(Q, Qf, R, xf, n, m, N, M, V)
+    objective = TO.LQRObjective(Q, R, Qf, xf, N)
 
     # create constraints
-    control_amp = BoundConstraint(x_max, x_min, u_max, u_min, n, m, M, V)
-    control_amp_boundary = BoundConstraint(x_max_boundary, x_min_boundary,
-                                           u_max_boundary, u_min_boundary, n, m, M, V)
-    target_astate_constraint = GoalConstraint(xf, V([model.state1_idx; model.state2_idx]),
-                                              n, m, M, V)
+    control_amp = TO.BoundConstraint(n, m, x_max=x_max, x_min=x_min, u_max=u_max, u_min=u_min)
+    control_amp_boundary = TO.BoundConstraint(n, m,
+                                              x_max=x_max_boundary, x_min=x_min_boundary,
+                                              u_max=u_max_boundary, u_min=u_min_boundary)
+    target_astate_constraint = TO.GoalConstraint(xf, [model.state1_idx; model.state2_idx])
     # add constraints
-    constraints = ConstraintList(n, m, N, M, V)
-    add_constraint!(constraints, control_amp, V(2:N-2))
-    add_constraint!(constraints, control_amp_boundary, V(N-1:N-1))
-    add_constraint!(constraints, target_astate_constraint, V(N:N))
+    constraints = TO.ConstraintList(n, m, N)
+    TO.add_constraint!(constraints, control_amp, 2:N-2)
+    TO.add_constraint!(constraints, control_amp_boundary, N-1:N-1)
+    TO.add_constraint!(constraints, target_astate_constraint, N:N)
     
     # build problem
-    prob = Problem(EXP, model, objective, constraints, X0, U0, ts, N, M, Md, V)
+    prob = TO.Problem(model, objective, xf, evolution_time,
+                      constraints=constraints, t0=t0, x0=x0, N=N, X0=X0, U0=U0,
+                      dt=dt, integration=EXP)
     # options
     verbose_pn = verbose ? true : false
     verbose_ = verbose ? 2 : 0
@@ -198,13 +204,13 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
     n_steps = smoke_test ? 1 : 2
     opts = SolverOptions(
         verbose_pn=verbose_pn, verbose=verbose_,
-        ilqr_max_iterations=ilqr_max_iterations,
-        al_max_iterations=al_max_iterations, n_steps=n_steps, iterations=max_iterations,
+        iterations_inner=ilqr_max_iterations,
+        iterations_outer=al_max_iterations, n_steps=n_steps, iterations=max_iterations,
         bp_reg_fp=bp_reg_fp, dJ_counter_limit=dJ_counter_limit, bp_reg_type=bp_reg_type,
-        projected_newton=false,
+        projected_newton=projected_newton,
     )
     # solve
-    solver = ALTROSolver(prob, opts)
+    solver = projected_newton ? ALTROSolver(prob, opts) : Altro.AugmentedLagrangianSolver(prob, opts)
     if benchmark
         benchmark_result = Altro.benchmark_solve!(solver)
     else
@@ -218,7 +224,7 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
     # post-process
     acontrols_raw = Altro.controls(solver)
     acontrols_arr = permutedims(reduce(hcat, map(Array, acontrols_raw)), [2, 1])
-    astates_raw = Altro.states(solver)
+    astates_raw = TO.states(solver)
     astates_arr = permutedims(reduce(hcat, map(Array, astates_raw)), [2, 1])
     state1_idx_arr = Array(model.state1_idx)
     state2_idx_arr = Array(model.state2_idx)
@@ -226,7 +232,8 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
     dcontrols_idx_arr = Array(model.dcontrols_idx)
     d2controls_idx_arr = Array(model.d2controls_idx)
     dt_idx_arr = Array(model.dt_idx)
-    max_v, max_v_info = Altro.max_violation_info(solver)
+    max_v = TO.max_violation(solver)
+    max_v_info = TO.findmax_violation(TO.get_constraints(solver))
     iterations_ = Altro.iterations(solver)
     if time_optimal
         ts = cumsum(map(x -> x^2, acontrols_arr[:,model.dt_idx[1]]))
