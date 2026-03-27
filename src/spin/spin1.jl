@@ -93,7 +93,8 @@ end
 function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
                   time_optimal=false, qs=[1e0, 1e-1, 1e-1, 1e-1, 1e-1], smoke_test=false,
                   save=true, benchmark=false, max_iterations=10000, bp_reg_fp=10.,
-                  dJ_counter_limit=20, bp_reg_type=:control, projected_newton=false)
+                  dJ_counter_limit=20, bp_reg_type=:control, projected_newton=false,
+                  memory_efficient=true)
     # initialize model
     Hs = [M(H) for H in (NEGI_H0_ISO, NEGI_H1_ISO)]
     model = Model(M, Md, V, Hs, time_optimal)
@@ -208,6 +209,7 @@ function run_traj(;evolution_time=20., dt=DT_PREF, verbose=true,
         iterations_outer=al_max_iterations, n_steps=n_steps, iterations=max_iterations,
         bp_reg_fp=bp_reg_fp, dJ_counter_limit=dJ_counter_limit, bp_reg_type=bp_reg_type,
         projected_newton=projected_newton,
+        memory_efficient=memory_efficient,
     )
     # solve
     solver = projected_newton ? ALTROSolver(prob, opts) : Altro.AugmentedLagrangianSolver(prob, opts)
