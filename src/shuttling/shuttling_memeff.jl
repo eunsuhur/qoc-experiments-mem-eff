@@ -66,7 +66,6 @@ function TO.gradient!(E, cost::ShuttlingDiagonalCost, z::RD.AbstractKnotPoint, c
 end
 
 function TO.hessian!(E, cost::ShuttlingDiagonalCost, z::RD.AbstractKnotPoint, cache=nothing)
-    fill!(E.hess, zero(eltype(E.hess)))
     @inbounds for i in eachindex(cost.Q)
         E.Q[i, i] = cost.Q[i]
     end
@@ -202,6 +201,8 @@ end
     end
     return astate
 end
+
+@inline ramp_time_for_peak_velocity(acc::Float64, v_peak::Float64) = v_peak / acc
 
 function get_propagation_cache!(model::Model, ::Type{T}) where T
     cache = model.cache[]
@@ -479,6 +480,9 @@ function TO.jacobian!(J, con::AccelerationGradientConstraint, x::AbstractVector,
     return true
 end
 
+# GPU support (included after Model and dynamics definitions)
+include(joinpath(@__DIR__, "shuttling_gpu.jl"))
+
 function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
                   T_hold=20.0,
                   transport_time=20_000.0,
@@ -488,7 +492,8 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
                   verbose=true, save=true, show_progress=true, benchmark=false,
                   iterations_inner=300, iterations_outer=30, n_steps=2,
                   max_iterations=10_000, bp_reg_fp=10.0, dJ_counter_limit=20,
-                  bp_reg_type=:control, projected_newton=false, return_solver=false)
+                  bp_reg_type=:control, projected_newton=false, pn_only=false,
+                  return_solver=false, gpu=false)
     evolution_time = 2 * T_hold + transport_time
     dt = evolution_time / N_t
     dt_max = 2 * dt
@@ -526,6 +531,7 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
     xf[center_idx(model)] = x_target
     xf[dcenter_idx(model)] = 0.0
     xf[amplitude_idx(model)] = amp_target
+    xf[damplitude_idx(model)] = 0.0
 
     X0 = [zeros(n) for k = 1:N]
     X0[1] .= x0
@@ -549,6 +555,10 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
     Qf = zeros(Float64, n)
     Qf[model.state1_idx] .= qf_state
     Qf[model.state2_idx] .= qf_state
+    Qf[center_idx(model)] = qf_state
+    Qf[dcenter_idx(model)] = qf_state
+    Qf[amplitude_idx(model)] = qf_state
+    Qf[damplitude_idx(model)] = qf_state
 
     R = zeros(Float64, m)
     R[d2center_idx(model)] = r_alpha
@@ -570,7 +580,7 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
         d2center_idx(model):d2center_idx(model),
     )
 
-    boundary_goal_idxs = [center_idx(model), dcenter_idx(model), amplitude_idx(model)]
+    boundary_goal_idxs = [center_idx(model), dcenter_idx(model), amplitude_idx(model), damplitude_idx(model)]
     boundary_goal = TO.GoalConstraint(xf, boundary_goal_idxs)
 
     constraints = TO.ConstraintList(n, m, N)
@@ -609,7 +619,19 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
         n_steps=n_steps, iterations=max_iterations,
         bp_reg_fp=bp_reg_fp, dJ_counter_limit=dJ_counter_limit, bp_reg_type=bp_reg_type,
         projected_newton=projected_newton, memory_efficient=true,
+        gpu=gpu,
     )
+
+    # Create GPU caches if gpu=true
+    if gpu
+        gpu_jac_cache = GpuJacobianCache(model)
+        gpu_bp_ws = GpuBackwardPassWorkspace(Float64, n, m)
+        opts.gpu_cache = GpuSolverCache(gpu_jac_cache, gpu_bp_ws,
+                                         backwardpass_memory_efficient_gpu!)
+        if verbose
+            println("GPU mode enabled — using decomposed ForwardDiff on CUDA")
+        end
+    end
 
     if verbose
         println(@sprintf("shuttling mem-eff problem: N_x=%d, N_t=%d, n=%d, m=%d, dt=%.6f ns",
@@ -617,7 +639,13 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
         println(@sprintf("initial energy = %.6e, target energy = %.6e", vals_initial[1], vals_final[1]))
     end
 
-    solver = projected_newton ? ALTROSolver(prob, opts) : Altro.AugmentedLagrangianSolver(prob, opts)
+    solver = if pn_only
+        Altro.MemEffProjectedNewtonSolver(prob, opts)
+    elseif projected_newton
+        ALTROSolver(prob, opts)
+    else
+        Altro.AugmentedLagrangianSolver(prob, opts)
+    end
     if benchmark
         benchmark_result = Altro.benchmark_solve!(solver)
     else
@@ -713,4 +741,362 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
     end
 
     return return_solver ? (result=result, solver=solver) : result
+end
+
+
+function simulate_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
+                       T_hold=2000.0,
+                       profile=:trapezoid,
+                       transport_time=20_000.0,
+                       x_target=X_TARGET_NM, amp_target=AMP_TARGET,
+                       acc=1.3333e-5, t1=5000.0, t2=0.0, v_peak=nothing,
+                       a3=1.0, a4=1.0,
+                       time_optimal=false)
+    time_optimal && throw(ArgumentError("simulate_traj only supports fixed dt motion profiles"))
+
+    local T_transit::Float64
+    local evolution_time::Float64
+    local x_target_local::Float64
+    local amp_target_local::Float64
+    local ts::Vector{Float64}
+    local xc_ts::Vector{Float64}
+    local vc_ts::Vector{Float64}
+    local amp_ts::Vector{Float64}
+    local alpha_ts::Vector{Float64}
+
+    if profile == :trapezoid
+        if !isnothing(v_peak)
+            t1 = ramp_time_for_peak_velocity(Float64(acc), Float64(v_peak))
+        end
+        T_transit = 2 * t1 + t2
+        x_target_local = acc * t1 * (t1 + t2)
+        evolution_time = 2 * T_hold + T_transit
+        dt = evolution_time / N_t
+        ts = collect(dt .* (0:N_t))
+
+        v_max = acc * t1
+        function vc_of_t(t)
+            tau = t - T_hold
+            if tau <= 0
+                return 0.0
+            elseif tau < t1
+                return acc * tau
+            elseif tau < t1 + t2
+                return v_max
+            elseif tau < T_transit
+                tau3 = tau - t1 - t2
+                return v_max - acc * tau3
+            else
+                return 0.0
+            end
+        end
+        function xc_of_t(t)
+            tau = t - T_hold
+            if tau <= 0
+                return 0.0
+            elseif tau < t1
+                return 0.5 * acc * tau^2
+            elseif tau < t1 + t2
+                tau2 = tau - t1
+                return 0.5 * acc * t1^2 + v_max * tau2
+            elseif tau < T_transit
+                tau3 = tau - t1 - t2
+                return 0.5 * acc * t1^2 + v_max * t2 + v_max * tau3 - 0.5 * acc * tau3^2
+            else
+                return x_target_local
+            end
+        end
+        xc_ts = xc_of_t.(ts)
+        vc_ts = vc_of_t.(ts)
+        alpha_ts = similar(ts)
+        @inbounds for k in eachindex(ts)
+            tau = ts[k] - T_hold
+            if tau <= 0 || tau >= T_transit
+                alpha_ts[k] = 0.0
+            elseif tau < t1
+                alpha_ts[k] = acc
+            elseif tau < t1 + t2
+                alpha_ts[k] = 0.0
+            else
+                alpha_ts[k] = -acc
+            end
+        end
+        amp_target_local = a4
+        amp_ts = similar(ts)
+        @inbounds for k in eachindex(ts)
+            s = x_target_local == 0 ? 0.0 : clamp(xc_ts[k] / x_target_local, 0.0, 1.0)
+            amp_ts[k] = a3 + (a4 - a3) * s
+        end
+    elseif profile == :min_jerk
+        x_target_local = x_target
+        amp_target_local = amp_target
+        evolution_time = 2 * T_hold + transport_time
+        dt = evolution_time / N_t
+        ts = collect(range(0.0, stop=evolution_time, length=N_t + 1))
+        T_transit = transport_time
+        t_start = T_hold
+        t_stop = ts[end] - T_hold
+        xc_ts = zeros(length(ts))
+        vc_ts = zeros(length(ts))
+        alpha_ts = zeros(length(ts))
+        @inbounds for k in eachindex(ts)
+            xc_ts[k], vc_ts[k], alpha_ts[k] = min_jerk_profile(ts[k], t_start, t_stop, x_target_local)
+        end
+        amp_ts = fill(amp_target_local, length(ts))
+    else
+        throw(ArgumentError("unsupported profile $(profile); use :trapezoid or :min_jerk"))
+    end
+
+    N = N_t + 1
+
+    full_L = 2 * (max(abs(x_target_local), w0) + 2 * w0)
+    dx = full_L / N_x
+    xs = gen_axis_centered(N_x; dx=dx)
+    model = Model(xs, dt; T_well=T_well, w0=w0, time_optimal=false)
+    n, m = size(model)
+
+    V_initial = zeros(Float64, model.N_x)
+    potential_profile!(V_initial, xs, 0.0, amp_ts[1], model.c2_base, model.inv_w0sq)
+    vals_initial, vecs_initial = eigensolve_1d(collect(V_initial), collect(xs))
+    psi_initial = normalize!(ComplexF64.(vecs_initial[:, 1]))
+    x0 = zeros(Float64, n)
+    pack_state!(x0, psi_initial, model.state1_idx, model.state2_idx)
+    x0[center_idx(model)] = 0.0
+    x0[dcenter_idx(model)] = 0.0
+    x0[amplitude_idx(model)] = amp_ts[1]
+    x0[damplitude_idx(model)] = 0.0
+
+    V_final = zeros(Float64, model.N_x)
+    potential_profile!(V_final, xs, x_target_local, amp_target_local, model.c2_base, model.inv_w0sq)
+    vals_final, vecs_final = eigensolve_1d(collect(V_final), collect(xs))
+    psi_target = normalize!(ComplexF64.(vecs_final[:, 1]))
+    xf = zeros(Float64, n)
+    pack_state!(xf, psi_target, model.state1_idx, model.state2_idx)
+    xf[center_idx(model)] = x_target_local
+    xf[dcenter_idx(model)] = 0.0
+    xf[amplitude_idx(model)] = amp_target_local
+
+    astates = zeros(Float64, N, n)
+    acontrols = zeros(Float64, N - 1, m)
+    astates[1, :] .= x0
+
+    @inbounds for k = 1:N
+        astates[k, center_idx(model)] = xc_ts[k]
+        astates[k, dcenter_idx(model)] = vc_ts[k]
+        astates[k, amplitude_idx(model)] = amp_ts[k]
+        astates[k, damplitude_idx(model)] = 0.0
+    end
+    for k = 1:N-1
+        acontrols[k, d2center_idx(model)] = alpha_ts[k]
+        acontrols[k, d2amplitude_idx(model)] = 0.0
+        psi_next = RD.discrete_dynamics(EXP, model, view(astates, k, :), view(acontrols, k, :), ts[k], dt)
+        astates[k + 1, model.state1_idx] .= psi_next[model.state1_idx]
+        astates[k + 1, model.state2_idx] .= psi_next[model.state2_idx]
+    end
+
+    return Dict(
+        "acontrols" => acontrols,
+        "astates" => astates,
+        "dt" => dt,
+        "ts" => ts,
+        "xs" => xs,
+        "dx" => dx,
+        "evolution_time" => evolution_time,
+        "transport_time" => transport_time,
+        "T_transit" => T_transit,
+        "T_hold" => T_hold,
+        "x_target" => x_target_local,
+        "amp_target" => amp_target_local,
+        "xc_ts" => xc_ts,
+        "vc_ts" => vc_ts,
+        "amp_ts" => amp_ts,
+        "profile" => String(profile),
+        "acc" => acc,
+        "t1" => t1,
+        "t2" => t2,
+        "a3" => a3,
+        "a4" => a4,
+        "N_x" => N_x,
+        "N_t" => N_t,
+        "T_well" => T_well,
+        "w0" => w0,
+        "state1_idx" => Array(model.state1_idx),
+        "state2_idx" => Array(model.state2_idx),
+        "controls_idx" => Array(model.controls_idx),
+        "dcontrols_idx" => Array(model.dcontrols_idx),
+        "d2controls_idx" => Array(model.d2controls_idx),
+        "dt_idx" => Array(model.dt_idx),
+        "time_optimal" => 0,
+        "memory_efficient" => 1,
+        "target_state" => xf,
+        "initial_state" => x0,
+        "target_energy" => vals_final[1],
+        "initial_energy" => vals_initial[1],
+        "solver_status" => "simulation_only",
+        "save_type" => Int(jl),
+    )
+end
+
+
+function gif_from_result(res;
+                         fps=12,
+                         frame_stride=10,
+                         xlims=nothing,
+                         density_ylims=nothing,
+                         potential_ylims=nothing,
+                         file_name=EXPERIMENT_NAME)
+    xs = Vector{Float64}(res["xs"])
+    ts = Vector{Float64}(res["ts"])
+    astates = res["astates"]
+    state1_idx = Vector{Int}(res["state1_idx"])
+    state2_idx = Vector{Int}(res["state2_idx"])
+    controls_idx = Vector{Int}(res["controls_idx"])
+    T_well = Float64(res["T_well"])
+    w0 = Float64(res["w0"])
+    x_target = Float64(res["x_target"])
+    amp_target = Float64(res["amp_target"])
+    target_state = Vector{Float64}(res["target_state"])
+
+    target_ψ = unpack_state(target_state, state1_idx, state2_idx)
+    target_density = abs2.(target_ψ)
+    c2_base = KB * T_well
+    inv_w0sq = 2.0 / w0^2
+
+    density_ylims = isnothing(density_ylims) ? (0.0, 1.1 * maximum(target_density)) : density_ylims
+    if isnothing(potential_ylims)
+        V0 = zeros(length(xs))
+        potential_profile!(V0, xs, x_target, amp_target, c2_base, inv_w0sq)
+        potential_ylims = (1.1 * minimum(V0), 0.1 * abs(minimum(V0)))
+    end
+
+    anim = Plots.@animate for k = 1:frame_stride:length(ts)
+        ψ = unpack_state(view(astates, k, :), state1_idx, state2_idx)
+        density = abs2.(ψ)
+        center = astates[k, controls_idx[1]]
+        amplitude = astates[k, controls_idx[2]]
+        V = zeros(length(xs))
+        potential_profile!(V, xs, center, amplitude, c2_base, inv_w0sq)
+
+        p1 = Plots.plot(xs, density, label="|psi|^2", linewidth=2,
+                        ylims=density_ylims,
+                        xlabel="x (nm)", ylabel="density",
+                        title=@sprintf("t = %.1f ns", ts[k]))
+        if !isnothing(xlims)
+            Plots.xlims!(p1, xlims)
+        end
+        Plots.plot!(p1, xs, target_density, label="target", linestyle=:dash, linewidth=2)
+        Plots.vline!(p1, [center], label="well center", linestyle=:dot)
+
+        p2 = Plots.plot(xs, V, label="V(x)", linewidth=2,
+                        ylims=potential_ylims,
+                        xlabel="x (nm)", ylabel="potential (rJ)")
+        if !isnothing(xlims)
+            Plots.xlims!(p2, xlims)
+        end
+        Plots.vline!(p2, [center], label="center", linestyle=:dot)
+
+        Plots.plot(p1, p2, layout=(2, 1), dpi=DPI, size=(700, 700))
+    end
+
+    plot_file_path = generate_file_path("gif", file_name, SAVE_PATH)
+    Plots.gif(anim, plot_file_path, fps=fps)
+    return plot_file_path
+end
+
+
+function simulate_with_controls(opt_res::Dict{String,<:Any})
+    xs = Vector{Float64}(opt_res["xs"])
+    dt = Float64(opt_res["dt"])
+    T_well = Float64(opt_res["T_well"])
+    w0 = Float64(opt_res["w0"])
+    time_optimal = Bool(opt_res["time_optimal"])
+    acontrols = Array(opt_res["acontrols"])
+    initial_state = Vector{Float64}(opt_res["initial_state"])
+    target_state = Vector{Float64}(opt_res["target_state"])
+
+    model = Model(xs, dt; T_well=T_well, w0=w0, time_optimal=time_optimal)
+    N = size(acontrols, 1) + 1
+    astates = zeros(Float64, N, model.n)
+    astates[1, :] .= initial_state
+    ts = zeros(Float64, N)
+    @inbounds for k = 1:N-1
+        astates[k + 1, :] .= RD.discrete_dynamics(EXP, model, view(astates, k, :), view(acontrols, k, :), ts[k], dt)
+        dt_local = time_optimal ? acontrols[k, dt_idx(model)]^2 : dt
+        ts[k + 1] = ts[k] + dt_local
+    end
+
+    sim_res = Dict{String,Any}(opt_res)
+    sim_res["astates"] = astates
+    sim_res["acontrols"] = acontrols
+    sim_res["ts"] = ts
+    sim_res["initial_state"] = initial_state
+    sim_res["target_state"] = target_state
+    sim_res["solver_status"] = "simulation_from_optimized_controls"
+    return sim_res
+end
+
+
+function to_gif(; fps=12, frame_stride=10, xlims=nothing, density_ylims=nothing,
+                potential_ylims=nothing, kwargs...)
+    res = run_traj(verbose=false, save=false, show_progress=false; kwargs...)
+    return gif_from_result(res;
+                           fps=fps,
+                           frame_stride=frame_stride,
+                           xlims=xlims,
+                           density_ylims=density_ylims,
+                           potential_ylims=potential_ylims,
+                           file_name=EXPERIMENT_NAME)
+end
+
+
+function simulate_to_gif(; fps=12, frame_stride=10, xlims=nothing, density_ylims=nothing,
+                         potential_ylims=nothing, kwargs...)
+    res = simulate_traj(; kwargs...)
+    return gif_from_result(res;
+                           fps=fps,
+                           frame_stride=frame_stride,
+                           xlims=xlims,
+                           density_ylims=density_ylims,
+                           potential_ylims=potential_ylims,
+                           file_name="$(EXPERIMENT_NAME)_sim")
+end
+
+
+function optimize_simulate_to_gif(; optimize=true,
+                                  replay_simulation=true,
+                                  make_gif=true,
+                                  save_optimization=false,
+                                  show_progress=false,
+                                  verbose=false,
+                                  fps=12,
+                                  frame_stride=10,
+                                  xlims=nothing,
+                                  density_ylims=nothing,
+                                  potential_ylims=nothing,
+                                  gif_name="$(EXPERIMENT_NAME)_opt_sim",
+                                  kwargs...)
+    optimize || throw(ArgumentError("optimize_simulate_to_gif requires optimize=true"))
+
+    opt_res = run_traj(verbose=verbose,
+                       save=save_optimization,
+                       show_progress=show_progress;
+                       kwargs...)
+    sim_res = replay_simulation ? simulate_with_controls(opt_res) : opt_res
+
+    gif_file_path = nothing
+    if make_gif
+        gif_file_path = gif_from_result(sim_res;
+                                        fps=fps,
+                                        frame_stride=frame_stride,
+                                        xlims=xlims,
+                                        density_ylims=density_ylims,
+                                        potential_ylims=potential_ylims,
+                                        file_name=gif_name)
+    end
+
+    return Dict(
+        "optimization" => opt_res,
+        "simulation" => sim_res,
+        "gif_file_path" => gif_file_path,
+    )
 end
