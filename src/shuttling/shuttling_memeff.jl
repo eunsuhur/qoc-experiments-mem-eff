@@ -17,6 +17,8 @@ using Printf
 const TO = Altro.TrajectoryOptimization
 const RD = Altro.RobotDynamics
 
+include(joinpath(@__DIR__, "heap_types.jl"))
+
 const EXPERIMENT_META = "shuttling"
 const EXPERIMENT_NAME = "shuttling_memeff"
 const SAVE_PATH = abspath(joinpath(WDIR, "out", EXPERIMENT_META, EXPERIMENT_NAME))
@@ -427,8 +429,18 @@ function TO.add_dynamics_constraints!(prob::TO.Problem{EXP}, integration::Type{E
     con_set = prob.constraints
     dyn_con = ShuttlingDynamicsConstraint{integration,typeof(prob.model)}(prob.model)
     TO.add_constraint!(con_set, dyn_con, 1:prob.N-1, idx)
-    SVector = getfield(TO, :SVector)
-    init_con = TO.GoalConstraint(n, prob.x0, SVector{n}(1:n))
+    init_con = HeapGoalConstraint(n, Vector{Float64}(prob.x0), collect(1:n))
+    TO.add_constraint!(con_set, init_con, 1, 1)
+    return nothing
+end
+
+# HeapProblem variant
+function TO.add_dynamics_constraints!(prob::HeapProblem{EXP}, integration::Type{EXP}=EXP, idx::Int=-1)
+    n, _ = size(prob.model)
+    con_set = prob.constraints
+    dyn_con = ShuttlingDynamicsConstraint{integration,typeof(prob.model)}(prob.model)
+    TO.add_constraint!(con_set, dyn_con, 1:prob.N-1, idx)
+    init_con = HeapGoalConstraint(n, Vector{Float64}(prob.x0), collect(1:n))
     TO.add_constraint!(con_set, init_con, 1, 1)
     return nothing
 end
@@ -483,6 +495,32 @@ end
 # GPU support (included after Model and dynamics definitions)
 include(joinpath(@__DIR__, "shuttling_gpu.jl"))
 
+function make_progress_callback(; progress_file::Union{String,Nothing}=nothing)
+    t_start = time()
+    last_print = Ref(0.0)
+    function callback(stats, phase)
+        now = time()
+        now - last_print[] < 2.0 && return  # throttle to every 2 seconds
+        last_print[] = now
+        elapsed = now - t_start
+        iter = stats.iterations
+        cost = isempty(stats.cost) ? NaN : stats.cost[end]
+        c_max = isempty(stats.c_max) ? NaN : stats.c_max[end]
+        msg = @sprintf("[%7.1fs] %s iter=%d  cost=%.6e  c_max=%.6e",
+                       elapsed, phase, iter, cost, c_max)
+        println(msg)
+        flush(stdout)
+        if progress_file !== nothing
+            open(progress_file, "w") do f
+                println(f, msg)
+                @printf(f, "elapsed=%.1f  phase=%s  iter=%d  cost=%.6e  c_max=%.6e\n",
+                        elapsed, phase, iter, cost, c_max)
+            end
+        end
+    end
+    return callback
+end
+
 function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
                   T_hold=20.0,
                   transport_time=20_000.0,
@@ -493,7 +531,8 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
                   iterations_inner=300, iterations_outer=30, n_steps=2,
                   max_iterations=10_000, bp_reg_fp=10.0, dJ_counter_limit=20,
                   bp_reg_type=:control, projected_newton=false, pn_only=false,
-                  return_solver=false, gpu=false)
+                  return_solver=false, gpu=false,
+                  progress_callback=nothing, progress_file::Union{String,Nothing}=nothing)
     evolution_time = 2 * T_hold + transport_time
     dt = evolution_time / N_t
     dt_max = 2 * dt
@@ -607,19 +646,28 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
     TO.add_constraint!(constraints, accel_gradient, 1:N-1)
     TO.add_constraint!(constraints, boundary_goal, N:N)
 
-    prob = TO.Problem(model, objective, xf, evolution_time;
-                      constraints=constraints, t0=t0, x0=x0, N=N, X0=X0, U0=U0,
-                      dt=dt, integration=EXP)
+    dts = fill(dt, N - 1)
+    t_knots = pushfirst!(cumsum(dts), 0.0)
+    Z = heap_traj(X0, U0, dts, t_knots)
+    prob = HeapProblem{EXP, Float64}(model, objective, constraints,
+        x0, xf, Z, N, t0, evolution_time)
 
     verbose_pn = verbose ? true : false
     verbose_ = verbose ? 2 : 0
+    cb = if progress_callback !== nothing
+        progress_callback
+    elseif progress_file !== nothing || verbose
+        make_progress_callback(progress_file=progress_file)
+    else
+        nothing
+    end
     opts = Altro.SolverOptions(
         verbose_pn=verbose_pn, verbose=verbose_,
         iterations_inner=iterations_inner, iterations_outer=iterations_outer,
         n_steps=n_steps, iterations=max_iterations,
         bp_reg_fp=bp_reg_fp, dJ_counter_limit=dJ_counter_limit, bp_reg_type=bp_reg_type,
         projected_newton=projected_newton, memory_efficient=true,
-        gpu=gpu,
+        gpu=gpu, progress_callback=cb,
     )
 
     # Create GPU caches if gpu=true
@@ -639,12 +687,13 @@ function run_traj(; T_well=1e-3, w0=500.0, N_x=4096, N_t=8000,
         println(@sprintf("initial energy = %.6e, target energy = %.6e", vals_initial[1], vals_final[1]))
     end
 
+    stats = Altro.SolverStats(parent=Altro.solvername(Altro.MemEffAugmentedLagrangianSolver))
     solver = if pn_only
         Altro.MemEffProjectedNewtonSolver(prob, opts)
     elseif projected_newton
         ALTROSolver(prob, opts)
     else
-        Altro.AugmentedLagrangianSolver(prob, opts)
+        Altro.MemEffAugmentedLagrangianSolver(prob, opts, stats, Val(:heap))
     end
     if benchmark
         benchmark_result = Altro.benchmark_solve!(solver)
